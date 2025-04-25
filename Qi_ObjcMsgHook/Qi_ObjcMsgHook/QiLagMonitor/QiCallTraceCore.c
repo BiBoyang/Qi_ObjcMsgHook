@@ -11,8 +11,7 @@
 #ifdef __aarch64__
 
 #pragma mark - fishhook
-#include <stddef.h>
-#include <stdint.h>
+
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +19,8 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+#include <sys/mman.h>
+#include <mach/mach.h>
 
 /*
  * A structure representing a particular intended rebinding from a symbol
@@ -40,7 +41,6 @@ struct rebinding {
  * is rebound more than once, the later rebinding will take precedence.
  */
 static int fish_rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel);
-
 
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -71,11 +71,11 @@ static struct rebindings_entry *_rebindings_head;
 static int prepend_rebindings(struct rebindings_entry **rebindings_head,
                               struct rebinding rebindings[],
                               size_t nel) {
-    struct rebindings_entry *new_entry = malloc(sizeof(struct rebindings_entry));
+    struct rebindings_entry *new_entry = (struct rebindings_entry *) malloc(sizeof(struct rebindings_entry));
     if (!new_entry) {
         return -1;
     }
-    new_entry->rebindings = malloc(sizeof(struct rebinding) * nel);
+    new_entry->rebindings = (struct rebinding *) malloc(sizeof(struct rebinding) * nel);
     if (!new_entry->rebindings) {
         free(new_entry);
         return -1;
@@ -95,6 +95,35 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            uint32_t *indirect_symtab) {
     uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
     void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
+    
+    // 添加内存保护修改
+    bool success = false;
+    int protection = 0;
+    if (mprotect(indirect_symbol_bindings, section->size, PROT_READ | PROT_WRITE) == 0) {
+        success = true;
+    } else {
+        // 获取当前内存保护
+        vm_address_t address = (vm_address_t)indirect_symbol_bindings;
+        vm_size_t size = section->size;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+        memory_object_name_t object;
+        mach_vm_size_t size_out;
+        
+        kern_return_t kr = vm_region_64(mach_task_self(), &address, &size_out, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &info_count, &object);
+        if (kr == KERN_SUCCESS) {
+            protection = info.protection;
+            // 修改内存保护
+            if (vm_protect(mach_task_self(), (vm_address_t)indirect_symbol_bindings, section->size, 0, protection | VM_PROT_WRITE) == KERN_SUCCESS) {
+                success = true;
+            }
+        }
+    }
+    
+    if (!success) {
+        return;
+    }
+    
     for (uint i = 0; i < section->size / sizeof(void *); i++) {
         uint32_t symtab_index = indirect_symbol_indices[i];
         if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
@@ -103,13 +132,12 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
         }
         uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
         char *symbol_name = strtab + strtab_offset;
-        if (strnlen(symbol_name, 2) < 2) {
-            continue;
-        }
+        bool symbol_name_longer_than_1 = symbol_name[0] && symbol_name[1];
         struct rebindings_entry *cur = rebindings;
         while (cur) {
             for (uint j = 0; j < cur->rebindings_nel; j++) {
-                if (strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
+                if (symbol_name_longer_than_1 &&
+                    strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
                     if (cur->rebindings[j].replaced != NULL &&
                         indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
                         *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
@@ -121,6 +149,13 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
             cur = cur->next;
         }
     symbol_loop:;
+    }
+    
+    // 恢复内存保护
+    if (success && protection != 0) {
+        vm_protect(mach_task_self(), (vm_address_t)indirect_symbol_bindings, section->size, 0, protection);
+    } else if (success) {
+        mprotect(indirect_symbol_bindings, section->size, PROT_READ | PROT_EXEC);
     }
 }
 
@@ -198,7 +233,6 @@ static int fish_rebind_symbols(struct rebinding rebindings[], size_t rebindings_
     }
     // If this was the first call, register callback for image additions (which is also invoked for
     // existing images, otherwise, just run on existing images
-    //首先是遍历 dyld 里的所有的 image，取出 image header 和 slide。注意第一次调用时主要注册 callback
     if (!_rebindings_head->next) {
         _dyld_register_func_for_add_image(_rebind_symbols_for_image);
     } else {
@@ -209,7 +243,6 @@ static int fish_rebind_symbols(struct rebinding rebindings[], size_t rebindings_
     }
     return retval;
 }
-
 
 #pragma mark - Record
 
